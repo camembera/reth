@@ -121,3 +121,5 @@ test-utils = [
     "reth-evm-ethereum/test-utils",
     "reth-tasks/test-utils",
 ]
+rocksdb = ["reth-provider/rocksdb", "reth-db-common/rocksdb"]
+edge = ["rocksdb"]

@@ -110,6 +110,7 @@ reth-provider = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 
 [features]
+default = []
 arbitrary = [
     "dep:proptest",
     "dep:arbitrary",
@@ -134,3 +135,6 @@ arbitrary = [
     "reth-primitives-traits/arbitrary",
     "reth-ethereum-primitives/arbitrary",
 ]
+
+rocksdb = ["reth-db-common/rocksdb", "reth-stages/rocksdb", "reth-provider/rocksdb", "reth-prune/rocksdb"]
+edge = ["rocksdb"]

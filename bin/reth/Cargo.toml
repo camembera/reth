@@ -70,7 +70,7 @@ aquamarine.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
-alloy-node-bindings = "1.5.2"
+alloy-node-bindings = "1.6.3"
 alloy-provider = { workspace = true, features = ["reqwest"] }
 alloy-rpc-types-eth.workspace = true
 backon.workspace = true
@@ -89,6 +89,7 @@ default = [
     "keccak-cache-global",
     "asm-keccak",
     "min-debug-logs",
+    "rocksdb",
 ]
 
 otlp = [
@@ -190,6 +191,8 @@ min-trace-logs = [
 ]
 
 trie-debug = ["reth-node-builder/trie-debug", "reth-node-core/trie-debug"]
+rocksdb = ["reth-ethereum-cli/rocksdb", "reth-node-core/rocksdb"]
+edge = ["rocksdb"]
 
 [[bin]]
 name = "reth"
