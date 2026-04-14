@@ -931,6 +931,65 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         handle
     }
 
+    /// Like [`start_network`](Self::start_network) but installs a provenance callback on the
+    /// [`TransactionsManager`] that is invoked with `(peer_id, &[tx_hash])` for each batch of
+    /// transactions first seen from a peer.
+    pub fn start_network_with_provenance_callback<Pool, N>(
+        &self,
+        builder: NetworkBuilder<(), (), N>,
+        pool: Pool,
+        cb: std::sync::Arc<dyn Fn(reth_network_peers::PeerId, &[alloy_primitives::TxHash]) + Send + Sync>,
+    ) -> NetworkHandle<N>
+    where
+        N: NetworkPrimitives,
+        Pool: TransactionPool<
+                Transaction: PoolTransaction<
+                    Consensus = N::BroadcastedTransaction,
+                    Pooled = N::PooledTransaction,
+                >,
+            > + Unpin
+            + 'static,
+        Node::Provider: BlockReaderFor<N>,
+    {
+        let (handle, network, txpool, eth) = builder
+            .transactions_with_policies(
+                pool,
+                self.config().network.transactions_manager_config(),
+                self.config().network.tx_propagation_policy,
+                StrictEthAnnouncementFilter::default(),
+            )
+            .with_tx_provenance_callback(cb)
+            .request_handler(self.provider().clone())
+            .split_with_handle();
+
+        self.executor.spawn_critical_blocking_task("p2p txpool", Box::pin(txpool));
+        self.executor.spawn_critical_blocking_task("p2p eth request handler", Box::pin(eth));
+
+        let default_peers_path = self.config().datadir().known_peers();
+        let known_peers_file = self.config().network.persistent_peers_file(default_peers_path);
+        self.executor.spawn_critical_with_graceful_shutdown_signal(
+            "p2p network task",
+            |shutdown| {
+                Box::pin(network.run_until_graceful_shutdown(shutdown, |network| {
+                    if let Some(peers_file) = known_peers_file {
+                        let num_known_peers = network.num_known_peers();
+                        trace!(target: "reth::cli", peers_file=?peers_file, num_peers=%num_known_peers, "Saving current peers");
+                        match network.write_peers_to_file(peers_file.as_path()) {
+                            Ok(_) => {
+                                info!(target: "reth::cli", peers_file=?peers_file, "Wrote network peers to file");
+                            }
+                            Err(err) => {
+                                warn!(target: "reth::cli", %err, "Failed to write network peers to file");
+                            }
+                        }
+                    }
+                }))
+            },
+        );
+
+        handle
+    }
+
     /// Get the network secret from the given data dir
     fn network_secret(&self, data_dir: &ChainPath<DataDirPath>) -> eyre::Result<SecretKey> {
         let secret_key = self.config().network.secret_key(data_dir.p2p_secret())?;
