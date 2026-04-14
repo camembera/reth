@@ -280,9 +280,13 @@ impl<N: NetworkPrimitives> TransactionsHandle<N> {
 /// ### Security
 ///
 /// Rate limiting via reputation, bad transaction isolation, peer scoring.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 #[must_use = "Manager does nothing unless polled."]
 pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives> {
+    /// Optional callback invoked with `(peer_id, &[tx_hash])` for each batch of transactions
+    /// first seen from a peer. Used by bera-reth to populate the PoG provenance window.
+    #[debug(skip)]
+    provenance_callback: Option<Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>>,
     /// Access to the transaction pool.
     pool: Pool,
     /// Network access.
@@ -347,6 +351,17 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
 }
 
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
+    /// Sets a callback that is invoked with `(peer_id, &[tx_hash])` for each batch of
+    /// transactions first seen from a peer. Used by bera-reth to populate the PoG provenance
+    /// window without relying on log interception.
+    pub fn with_provenance_callback(
+        mut self,
+        cb: Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>,
+    ) -> Self {
+        self.provenance_callback = Some(cb);
+        self
+    }
+
     /// Sets up a new instance.
     ///
     /// Note: This expects an existing [`NetworkManager`](crate::NetworkManager) instance.
@@ -399,6 +414,7 @@ impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
             .increment(pending_pool_imports_info.max_pending_pool_imports as u64);
 
         Self {
+            provenance_callback: None,
             pool,
             network,
             network_events,
@@ -1474,6 +1490,12 @@ where
         // Record the transactions as seen by the peer
         for tx in &new_txs {
             self.transactions_by_peers.insert(*tx.hash(), smallvec::smallvec![peer_id]);
+        }
+        if let Some(cb) = &self.provenance_callback {
+            let hashes: Vec<TxHash> = new_txs.iter().map(|tx| *tx.hash()).collect();
+            if !hashes.is_empty() {
+                cb(peer_id, &hashes);
+            }
         }
 
         // 3. import new transactions as a batch to minimize lock contention on the underlying
