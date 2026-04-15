@@ -283,8 +283,9 @@ impl<N: NetworkPrimitives> TransactionsHandle<N> {
 #[derive(derive_more::Debug)]
 #[must_use = "Manager does nothing unless polled."]
 pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives> {
-    /// Optional callback invoked with `(peer_id, &[tx_hash])` for each batch of transactions
-    /// first seen from a peer. Used by bera-reth to populate the PoG provenance window.
+    /// Optional callback invoked with `(peer_id, &[tx_hash])` after each batch is accepted by
+    /// the transaction pool (`add_external_transactions` returned `Ok` per hash). Used by
+    /// bera-reth for PoG provenance (avoids attributing txs that failed pool validation).
     #[debug(skip)]
     provenance_callback: Option<Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>>,
     /// Access to the transaction pool.
@@ -351,9 +352,8 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
 }
 
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
-    /// Sets a callback that is invoked with `(peer_id, &[tx_hash])` for each batch of
-    /// transactions first seen from a peer. Used by bera-reth to populate the PoG provenance
-    /// window without relying on log interception.
+    /// Sets a callback invoked with `(peer_id, &[tx_hash])` **after** the pool accepts those
+    /// transactions (each hash has `PoolResult::Ok`). Used by bera-reth for PoG provenance.
     pub fn with_provenance_callback(
         mut self,
         cb: Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>,
@@ -1491,17 +1491,12 @@ where
         for tx in &new_txs {
             self.transactions_by_peers.insert(*tx.hash(), smallvec::smallvec![peer_id]);
         }
-        if let Some(cb) = &self.provenance_callback {
-            let hashes: Vec<TxHash> = new_txs.iter().map(|tx| *tx.hash()).collect();
-            if !hashes.is_empty() {
-                cb(peer_id, &hashes);
-            }
-        }
 
         // 3. import new transactions as a batch to minimize lock contention on the underlying
         // pool
         if !new_txs.is_empty() {
             let pool = self.pool.clone();
+            let provenance_callback = self.provenance_callback.clone();
             // update metrics
             let metric_pending_pool_imports = self.metrics.pending_pool_imports.clone();
             metric_pending_pool_imports.increment(new_txs.len() as f64);
@@ -1517,6 +1512,14 @@ where
             let import = Box::pin(async move {
                 let added = new_txs.len();
                 let res = pool.add_external_transactions(new_txs).await;
+
+                if let Some(cb) = provenance_callback {
+                    let accepted: Vec<TxHash> =
+                        res.iter().filter_map(|r| r.as_ref().ok().map(|outcome| outcome.hash)).collect();
+                    if !accepted.is_empty() {
+                        cb(peer_id, &accepted);
+                    }
+                }
 
                 // update metrics
                 metric_pending_pool_imports.decrement(added as f64);
