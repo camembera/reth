@@ -7,14 +7,13 @@ use crate::{
             AnnouncementFilteringPolicy, StrictEthAnnouncementFilter, TransactionPropagationKind,
         },
         policy::NetworkPolicies,
-        TransactionPropagationPolicy, TransactionsManager, TransactionsManagerConfig,
+        TransactionPropagationPolicy, TransactionProvenanceSink, TransactionsManager,
+        TransactionsManagerConfig,
     },
     NetworkHandle, NetworkManager,
 };
 use reth_eth_wire::{EthNetworkPrimitives, NetworkPrimitives};
 use reth_network_api::test_utils::PeersHandleProvider;
-use alloy_primitives::TxHash;
-use reth_network_peers::PeerId;
 use reth_transaction_pool::TransactionPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -137,15 +136,14 @@ impl<Tx, Eth, N: NetworkPrimitives> NetworkBuilder<Tx, Eth, N> {
     }
 }
 
-impl<Pool: TransactionPool, Eth, N: NetworkPrimitives> NetworkBuilder<TransactionsManager<Pool, N>, Eth, N> {
+impl<Pool: TransactionPool, Eth, N: NetworkPrimitives>
+    NetworkBuilder<TransactionsManager<Pool, N>, Eth, N>
+{
     /// Sets a provenance callback on the [`TransactionsManager`].
     ///
     /// The callback is invoked with `(peer_id, &[tx_hash])` for each batch of transactions
     /// first seen from a peer. Intended for Berachain PoG attribution.
-    pub fn with_tx_provenance_callback(
-        mut self,
-        cb: Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>,
-    ) -> Self {
+    pub fn with_tx_provenance_callback(mut self, cb: Arc<dyn TransactionProvenanceSink>) -> Self {
         self.transactions = self.transactions.with_provenance_callback(cb);
         self
     }

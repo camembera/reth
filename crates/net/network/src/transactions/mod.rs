@@ -11,6 +11,7 @@ pub mod constants;
 pub mod fetcher;
 /// Defines the traits for transaction-related policies.
 pub mod policy;
+mod provenance;
 
 pub use self::constants::{
     tx_fetcher::DEFAULT_SOFT_LIMIT_BYTE_SIZE_POOLED_TRANSACTIONS_RESP_ON_PACK_GET_POOLED_TRANSACTIONS_REQ,
@@ -22,6 +23,7 @@ pub use config::{
     TransactionPropagationMode, TransactionPropagationPolicy, TransactionsManagerConfig,
 };
 use policy::NetworkPolicies;
+pub use provenance::TransactionProvenanceSink;
 
 pub(crate) use fetcher::{FetchEvent, TransactionFetcher};
 
@@ -285,7 +287,7 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
     /// the transaction pool (`add_external_transactions` returned `Ok` per hash). Used by
     /// bera-reth for PoG provenance (avoids attributing txs that failed pool validation).
     #[debug(skip)]
-    provenance_callback: Option<Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>>,
+    provenance_callback: Option<Arc<dyn TransactionProvenanceSink>>,
     /// Access to the transaction pool.
     pool: Pool,
     /// Network access.
@@ -352,10 +354,7 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
     /// Sets a callback invoked with `(peer_id, &[tx_hash])` **after** the pool accepts those
     /// transactions (each hash has `PoolResult::Ok`). Used by bera-reth for PoG provenance.
-    pub fn with_provenance_callback(
-        mut self,
-        cb: Arc<dyn Fn(PeerId, &[TxHash]) + Send + Sync>,
-    ) -> Self {
+    pub fn with_provenance_callback(mut self, cb: Arc<dyn TransactionProvenanceSink>) -> Self {
         self.provenance_callback = Some(cb);
         self
     }
@@ -1476,10 +1475,12 @@ where
                 let res = pool.add_external_transactions(new_txs).await;
 
                 if let Some(cb) = provenance_callback {
-                    let accepted: Vec<TxHash> =
-                        res.iter().filter_map(|r| r.as_ref().ok().map(|outcome| outcome.hash)).collect();
+                    let accepted: Vec<TxHash> = res
+                        .iter()
+                        .filter_map(|r| r.as_ref().ok().map(|outcome| outcome.hash))
+                        .collect();
                     if !accepted.is_empty() {
-                        cb(peer_id, &accepted);
+                        cb.record_accepted_from_peer(peer_id, &accepted);
                     }
                 }
 
