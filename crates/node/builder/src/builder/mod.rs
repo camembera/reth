@@ -18,7 +18,7 @@ use reth_exex::ExExContext;
 use reth_network::{
     transactions::{
         config::{AnnouncementFilteringPolicy, StrictEthAnnouncementFilter},
-        TransactionPropagationPolicy, TransactionsManagerConfig,
+        TransactionPropagationPolicy, TransactionProvenanceSink, TransactionsManagerConfig,
     },
     NetworkBuilder, NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager,
     NetworkPrimitives,
@@ -958,7 +958,7 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         &self,
         builder: NetworkBuilder<(), (), N>,
         pool: Pool,
-        cb: std::sync::Arc<dyn Fn(reth_network_peers::PeerId, &[alloy_primitives::TxHash]) + Send + Sync>,
+        cb: std::sync::Arc<dyn TransactionProvenanceSink>,
     ) -> NetworkHandle<N>
     where
         N: NetworkPrimitives,
