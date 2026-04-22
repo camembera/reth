@@ -14,6 +14,10 @@
 /// Node event hooks.
 pub mod hooks;
 
+/// Optional **post-**`known_peers_write` hook (runs after `known-peers.json` is flushed on shutdown).
+pub mod post_known_peers_write;
+pub use post_known_peers_write::set_post_known_peers_write_hook;
+
 /// Support for configuring the higher level node types.
 pub mod node;
 pub use node::*;

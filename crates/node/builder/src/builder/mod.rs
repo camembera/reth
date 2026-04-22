@@ -997,6 +997,9 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                         match network.write_peers_to_file(peers_file.as_path()) {
                             Ok(_) => {
                                 info!(target: "reth::cli", peers_file=?peers_file, "Wrote network peers to file");
+                                crate::post_known_peers_write::run_post_known_peers_write_hook(
+                                    peers_file.as_path(),
+                                );
                             }
                             Err(err) => {
                                 warn!(target: "reth::cli", %err, "Failed to write network peers to file");
