@@ -68,6 +68,12 @@ pub struct SessionInfo {
     pub version: EthVersion,
     /// The kind of peer this session represents
     pub peer_kind: PeerKind,
+    /// The peer's first-hear advertised listening socket: `remote_addr.ip()` paired with the
+    /// `port` field from the devp2p `HelloMessage`. `None` when the peer signalled `Hello.port
+    /// == 0` (peer not listening, or did not populate the field). For inbound-pure sessions
+    /// this is the only re-dialable address available — the connection's source port is
+    /// ephemeral, see `crates/net/network/src/peers.rs`. See BERA-305 brief.
+    pub listening_addr: Option<SocketAddr>,
 }
 
 /// (Non-exhaustive) List of the different events emitted by the network that are of interest for

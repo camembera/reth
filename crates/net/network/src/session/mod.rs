@@ -497,6 +497,7 @@ impl<N: NetworkPrimitives> SessionManager<N> {
                 status,
                 direction,
                 client_id,
+                listening_addr,
             } => {
                 // move from pending to established.
                 self.remove_pending_session(&session_id);
@@ -612,6 +613,7 @@ impl<N: NetworkPrimitives> SessionManager<N> {
                     direction,
                     timeout,
                     range_info: None,
+                    listening_addr,
                 })
             }
             PendingSessionEvent::Disconnected { remote_addr, session_id, direction, error } => {
@@ -747,6 +749,10 @@ pub enum SessionEvent<N: NetworkPrimitives> {
         timeout: Arc<AtomicU64>,
         /// The range info for the peer.
         range_info: Option<BlockRangeInfo>,
+        /// The peer's first-hear advertised listening socket — `remote_addr.ip()` paired with
+        /// the `port` field from the devp2p `HelloMessage`. `None` when the peer signalled
+        /// `Hello.port == 0`. See BERA-305 brief.
+        listening_addr: Option<SocketAddr>,
     },
     /// The peer was already connected with another session.
     AlreadyConnected {
@@ -1172,6 +1178,8 @@ async fn authenticate_stream<N: NetworkPrimitives>(
         (multiplex_stream.into(), their_status)
     };
 
+    let listening_addr = compute_listening_addr(remote_addr, their_hello.port);
+
     PendingSessionEvent::Established {
         session_id,
         remote_addr,
@@ -1182,5 +1190,74 @@ async fn authenticate_stream<N: NetworkPrimitives>(
         conn,
         direction,
         client_id: their_hello.client_version,
+        listening_addr,
+    }
+}
+
+/// Compute the peer's first-hear advertised listening socket from the connection's
+/// `remote_addr` and the `port` field in the devp2p `HelloMessage` the peer sent.
+///
+/// For inbound-pure peers, `remote_addr.port()` is the ephemeral source port and cannot be
+/// dialed back; `their_hello.port` (per devp2p Hello spec) is the only signal we have for the
+/// peer's actual listening port. `port == 0` means the peer is not listening, in which case we
+/// return `None` (no re-dialable socket available — the BERA-305 brief defers Discv4
+/// EnrRequest fallback to BERA-306).
+///
+/// See devp2p Hello spec: <https://github.com/ethereum/devp2p/blob/master/rlpx.md#hello-0x00>.
+fn compute_listening_addr(remote_addr: SocketAddr, hello_port: u16) -> Option<SocketAddr> {
+    (hello_port != 0).then(|| SocketAddr::new(remote_addr.ip(), hello_port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_listening_addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// TP-1 (BERA-305): a session with `Hello.port=30303` and an ephemeral `remote_addr.port`
+    /// (e.g. an inbound-pure session whose source port is whatever the kernel assigned)
+    /// produces `listening_addr == Some((remote_addr.ip(), 30303))`. Validates that the
+    /// post-change codebase preserves the peer's advertised listen port; pre-change this
+    /// information was discarded at the `start_session` boundary.
+    #[test]
+    fn inbound_pure_session_captures_listening_port() {
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 51234);
+        let hello_port = 30303u16;
+
+        let listening_addr = compute_listening_addr(remote_addr, hello_port);
+
+        assert_eq!(
+            listening_addr,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 30303)),
+            "listening_addr must combine remote_addr.ip() with their_hello.port, not \
+             remote_addr.port() (which is the ephemeral source port for inbound-pure sessions)",
+        );
+    }
+
+    /// TP-2 (BERA-305): a session with `Hello.port=0` (peer is not listening, per devp2p Hello
+    /// spec) yields `listening_addr == None`. No panic, no error path — graceful degradation.
+    /// Downstream the provenance callback receives `None` and persists `first_enode = NULL`.
+    #[test]
+    fn hello_port_zero_yields_none_listening_addr() {
+        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 51234);
+
+        let listening_addr = compute_listening_addr(remote_addr, 0);
+
+        assert!(
+            listening_addr.is_none(),
+            "Hello.port=0 must yield None (peer not listening per devp2p spec); got {listening_addr:?}",
+        );
+    }
+
+    /// IPv6 sanity: confirms the helper preserves the address family. `NodeRecord::Display`
+    /// brackets IPv6 at the wire boundary, so an IPv6 listening_addr round-trips through
+    /// canonical enode formatting unchanged.
+    #[test]
+    fn ipv6_remote_addr_preserves_family() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let remote_addr = SocketAddr::new(v6, 51234);
+
+        let listening_addr = compute_listening_addr(remote_addr, 30303);
+
+        assert_eq!(listening_addr, Some(SocketAddr::new(v6, 30303)));
     }
 }

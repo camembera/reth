@@ -123,6 +123,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                 direction,
                 timeout,
                 range_info,
+                listening_addr,
             } => {
                 self.state.on_session_activated(
                     peer_id,
@@ -141,6 +142,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                     messages,
                     status,
                     direction,
+                    listening_addr,
                 })
             }
             SessionEvent::AlreadyConnected { peer_id, remote_addr, direction } => {
@@ -397,6 +399,10 @@ pub(crate) enum SwarmEvent<N: NetworkPrimitives = EthNetworkPrimitives> {
         messages: PeerRequestSender<PeerRequest<N>>,
         status: Arc<UnifiedStatus>,
         direction: Direction,
+        /// The peer's first-hear advertised listening socket — `remote_addr.ip()` paired with
+        /// the `port` field from the devp2p `HelloMessage`. `None` when the peer signalled
+        /// `Hello.port == 0`. See BERA-305 brief.
+        listening_addr: Option<SocketAddr>,
     },
     SessionClosed {
         peer_id: PeerId,

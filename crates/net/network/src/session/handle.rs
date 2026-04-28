@@ -182,6 +182,10 @@ pub enum PendingSessionEvent<N: NetworkPrimitives> {
         direction: Direction,
         /// The remote node's user agent, usually containing the client name and version
         client_id: String,
+        /// The peer's first-hear advertised listening socket — `remote_addr.ip()` paired with
+        /// the `port` field from the devp2p `HelloMessage`. `None` when the peer signalled
+        /// `Hello.port == 0`. See BERA-305 brief for end-to-end rationale.
+        listening_addr: Option<SocketAddr>,
     },
     /// Handshake unsuccessful, session was disconnected.
     Disconnected {

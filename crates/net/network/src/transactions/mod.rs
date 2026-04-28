@@ -71,6 +71,7 @@ use reth_transaction_pool::{
 };
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
+    net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -352,8 +353,9 @@ pub struct TransactionsManager<Pool, N: NetworkPrimitives = EthNetworkPrimitives
 }
 
 impl<Pool: TransactionPool, N: NetworkPrimitives> TransactionsManager<Pool, N> {
-    /// Sets a callback invoked with `(peer_id, &[tx_hash])` **after** the pool accepts those
-    /// transactions (each hash has `PoolResult::Ok`). Used by bera-reth for PoG provenance.
+    /// Sets a callback invoked with `(peer_id, listening_addr, &[tx_hash])` **after** the pool
+    /// accepts those transactions (each hash has `PoolResult::Ok`). Used by bera-reth for PoG
+    /// provenance. `listening_addr` is the peer's first-hear advertised socket per BERA-305.
     pub fn with_provenance_callback(mut self, cb: Arc<dyn TransactionProvenanceSink>) -> Self {
         self.provenance_callback = Some(cb);
         self
@@ -1207,7 +1209,7 @@ where
         info: SessionInfo,
         messages: PeerRequestSender<PeerRequest<N>>,
     ) {
-        let SessionInfo { peer_id, client_version, version, .. } = info;
+        let SessionInfo { peer_id, client_version, version, listening_addr, .. } = info;
 
         // Insert a new peer into the peerset.
         let peer = PeerMetadata::<N>::new(
@@ -1216,6 +1218,7 @@ where
             client_version,
             self.config.max_transactions_seen_by_peer_history,
             info.peer_kind,
+            listening_addr,
         );
         let peer = match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
@@ -1365,6 +1368,7 @@ where
 
         let Some(peer) = self.peers.get_mut(&peer_id) else { return };
         let client_version = peer.client_version.clone();
+        let listening_addr = peer.listening_addr;
         let mut transactions = transactions.0;
 
         let start = Instant::now();
@@ -1480,7 +1484,7 @@ where
                         .filter_map(|r| r.as_ref().ok().map(|outcome| outcome.hash))
                         .collect();
                     if !accepted.is_empty() {
-                        cb.record_accepted_from_peer(peer_id, &accepted);
+                        cb.record_accepted_from_peer(peer_id, listening_addr, &accepted);
                     }
                 }
 
@@ -2027,6 +2031,12 @@ pub struct PeerMetadata<N: NetworkPrimitives = EthNetworkPrimitives> {
     client_version: Arc<str>,
     /// The kind of peer.
     peer_kind: PeerKind,
+    /// The peer's first-hear advertised listening socket — `remote_addr.ip()` paired with the
+    /// `port` field from the devp2p `HelloMessage` captured at session establishment. `None`
+    /// when the peer signalled `Hello.port == 0`. Forwarded to the
+    /// [`TransactionProvenanceSink`] callback so attribution-only peers remain re-dialable.
+    /// See BERA-305 brief.
+    listening_addr: Option<SocketAddr>,
 }
 
 impl<N: NetworkPrimitives> PeerMetadata<N> {
@@ -2037,6 +2047,7 @@ impl<N: NetworkPrimitives> PeerMetadata<N> {
         client_version: Arc<str>,
         max_transactions_seen_by_peer: u32,
         peer_kind: PeerKind,
+        listening_addr: Option<SocketAddr>,
     ) -> Self {
         Self {
             seen_transactions: LruCache::new(max_transactions_seen_by_peer),
@@ -2044,7 +2055,13 @@ impl<N: NetworkPrimitives> PeerMetadata<N> {
             version,
             client_version,
             peer_kind,
+            listening_addr,
         }
+    }
+
+    /// The peer's first-hear advertised listening socket. See [`Self::listening_addr`].
+    pub const fn listening_addr(&self) -> Option<SocketAddr> {
+        self.listening_addr
     }
 
     /// Returns a reference to the peer's request sender channel.
@@ -2201,8 +2218,29 @@ mod tests {
         future::poll_fn,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         str::FromStr,
+        sync::Mutex,
     };
     use tracing::error;
+
+    /// Test sink that captures every `record_accepted_from_peer` invocation. Used by TP-3 to
+    /// assert that the new `listening_addr` field flows from `SessionInfo` →
+    /// `handle_peer_session` → `PeerMetadata` → `import_transactions` callsite → the
+    /// registered [`TransactionProvenanceSink`].
+    #[derive(Default)]
+    struct RecordingProvenanceSink {
+        calls: Mutex<Vec<(PeerId, Option<SocketAddr>, Vec<TxHash>)>>,
+    }
+
+    impl TransactionProvenanceSink for RecordingProvenanceSink {
+        fn record_accepted_from_peer(
+            &self,
+            peer_id: PeerId,
+            listening_addr: Option<SocketAddr>,
+            accepted_tx_hashes: &[TxHash],
+        ) {
+            self.calls.lock().unwrap().push((peer_id, listening_addr, accepted_tx_hashes.to_vec()));
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ignored_tx_broadcasts_while_initially_syncing() {
@@ -2915,6 +2953,7 @@ mod tests {
             status: Arc::new(Default::default()),
             version: EthVersion::Eth68,
             peer_kind: PeerKind::Basic,
+            listening_addr: None,
         };
         let messages: PeerRequestSender<PeerRequest> = PeerRequestSender::new(peer_id, tx);
         tx_manager
@@ -2945,6 +2984,156 @@ mod tests {
         // propagate again
         let propagated = tx_manager.propagate_transactions(propagate, PropagationMode::Basic);
         assert!(propagated.0.is_empty());
+    }
+
+    /// TP-3 (BERA-305) part A: confirms that a `SessionInfo` carrying `listening_addr` is
+    /// preserved end-to-end into `PeerMetadata`, where the `import_transactions` callsite
+    /// picks it up and forwards it to the registered [`TransactionProvenanceSink`]. Probes
+    /// both the populated and `None` (legacy / `Hello.port == 0`) variants.
+    #[tokio::test]
+    async fn peer_metadata_carries_listening_addr_from_session_info() {
+        reth_tracing::init_test_tracing();
+
+        let (mut tx_manager, _network) = new_tx_manager().await;
+        let peer_id_with_addr = PeerId::random();
+        let peer_id_without_addr = PeerId::random();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 30303);
+
+        let (tx, _rx) = mpsc::channel::<PeerRequest>(1);
+        let messages = PeerRequestSender::new(peer_id_with_addr, tx);
+        let info_with = SessionInfo {
+            peer_id: peer_id_with_addr,
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51234),
+            client_version: Arc::from(""),
+            capabilities: Arc::new(vec![].into()),
+            status: Arc::new(Default::default()),
+            version: EthVersion::Eth68,
+            peer_kind: PeerKind::Basic,
+            listening_addr: Some(addr),
+        };
+        tx_manager.on_network_event(NetworkEvent::ActivePeerSession { info: info_with, messages });
+
+        let (tx, _rx) = mpsc::channel::<PeerRequest>(1);
+        let messages = PeerRequestSender::new(peer_id_without_addr, tx);
+        let info_without = SessionInfo {
+            peer_id: peer_id_without_addr,
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51235),
+            client_version: Arc::from(""),
+            capabilities: Arc::new(vec![].into()),
+            status: Arc::new(Default::default()),
+            version: EthVersion::Eth68,
+            peer_kind: PeerKind::Basic,
+            listening_addr: None,
+        };
+        tx_manager
+            .on_network_event(NetworkEvent::ActivePeerSession { info: info_without, messages });
+
+        let stored_with = tx_manager.peers.get(&peer_id_with_addr).expect("peer recorded");
+        assert_eq!(
+            stored_with.listening_addr(),
+            Some(addr),
+            "PeerMetadata must carry the listening_addr taken from SessionInfo (BERA-305)",
+        );
+
+        let stored_without = tx_manager.peers.get(&peer_id_without_addr).expect("peer recorded");
+        assert!(
+            stored_without.listening_addr().is_none(),
+            "Hello.port=0 sessions must yield listening_addr=None on PeerMetadata; got {:?}",
+            stored_without.listening_addr(),
+        );
+    }
+
+    /// TP-3 (BERA-305) part B: drives an end-to-end import of a real transaction from a peer
+    /// whose session info carries a populated `listening_addr`, and asserts that the registered
+    /// [`TransactionProvenanceSink`] receives the same `(peer_id, listening_addr, &[tx_hash])`
+    /// triple. Pre-change codebase has no `listening_addr` parameter on the trait, so the test
+    /// is structurally impossible to compile against the old signature — the trait change is
+    /// what enables this assertion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_callback_forwards_listening_addr() {
+        reth_tracing::init_test_tracing();
+
+        // Build a TransactionsManager with a recording provenance sink.
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let client = NoopProvider::default();
+        let pool = testing_pool();
+        let config = NetworkConfigBuilder::eth(secret_key)
+            .disable_discovery()
+            .listener_port(0)
+            .build(client);
+        let transactions_manager_config = config.transactions_manager_config.clone();
+        let (_network_handle, _network, mut tx_manager, _) = NetworkManager::new(config)
+            .await
+            .unwrap()
+            .into_builder()
+            .transactions(pool.clone(), transactions_manager_config)
+            .split_with_handle();
+
+        let sink = Arc::new(RecordingProvenanceSink::default());
+        tx_manager = tx_manager.with_provenance_callback(sink.clone() as Arc<_>);
+
+        // Mock a peer session with a populated listening_addr.
+        let peer_id = PeerId::random();
+        let listening_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 30303);
+        let (peer_tx, _peer_rx) = mpsc::channel::<PeerRequest>(1);
+        let messages = PeerRequestSender::new(peer_id, peer_tx);
+        let info = SessionInfo {
+            peer_id,
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51234),
+            client_version: Arc::from(""),
+            capabilities: Arc::new(vec![].into()),
+            status: Arc::new(Default::default()),
+            version: EthVersion::Eth68,
+            peer_kind: PeerKind::Basic,
+            listening_addr: Some(listening_addr),
+        };
+        tx_manager.on_network_event(NetworkEvent::ActivePeerSession { info, messages });
+
+        // Real signed tx (canonical eip1559 from existing test corpus).
+        let input = hex!(
+            "02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76"
+        );
+        let signed_tx = TransactionSigned::decode(&mut &input[..]).unwrap();
+        let expected_hash = *signed_tx.hash();
+
+        tx_manager.on_network_tx_event(NetworkTransactionEvent::IncomingTransactions {
+            peer_id,
+            msg: Transactions(vec![signed_tx]),
+        });
+
+        // Drive the manager poll until the pool import future resolves and fires the callback.
+        // We give it a generous deadline because the underlying pool import is async.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            poll_fn(|cx| {
+                let _ = tx_manager.poll_unpin(cx);
+                Poll::Ready(())
+            })
+            .await;
+            if !sink.calls.lock().unwrap().is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one record_accepted_from_peer invocation expected; got {calls:?}",
+        );
+        let (recorded_peer, recorded_addr, recorded_hashes) = &calls[0];
+        assert_eq!(*recorded_peer, peer_id);
+        assert_eq!(
+            *recorded_addr,
+            Some(listening_addr),
+            "TransactionProvenanceSink must receive the peer's first-hear listening_addr \
+             unchanged (BERA-305 trait change)",
+        );
+        assert_eq!(recorded_hashes.as_slice(), &[expected_hash]);
     }
 
     #[tokio::test]
