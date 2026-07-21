@@ -22,6 +22,15 @@ use std::{
 };
 use tracing::trace;
 
+/// Builds the best address available for attribution.
+///
+/// A zero port means the peer did not advertise a listening port, so callers must not assume the
+/// address can be redialed. Keeping the observed IP and peer ID still permits full enode
+/// attribution.
+fn attribution_addr(remote_addr: SocketAddr, peer_listen_port: Option<u16>) -> SocketAddr {
+    SocketAddr::new(remote_addr.ip(), peer_listen_port.unwrap_or(0))
+}
+
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// Contains the connectivity related state of the network.
 ///
@@ -134,6 +143,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                 timeout,
                 range_info,
                 supports_snap,
+                peer_listen_port,
             } => {
                 self.state.on_session_activated(SessionActivation {
                     peer: peer_id,
@@ -153,6 +163,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                     messages,
                     status,
                     direction,
+                    listening_addr: Some(attribution_addr(remote_addr, peer_listen_port)),
                 })
             }
             SessionEvent::AlreadyConnected { peer_id, remote_addr, direction } => {
@@ -407,6 +418,8 @@ pub(crate) enum SwarmEvent<N: NetworkPrimitives = EthNetworkPrimitives> {
         messages: PeerRequestSender<PeerRequest<N>>,
         status: Arc<UnifiedStatus>,
         direction: Direction,
+        /// Best-known peer address for attribution. Port zero means no redial port was advertised.
+        listening_addr: Option<SocketAddr>,
     },
     SessionClosed {
         peer_id: PeerId,
@@ -457,5 +470,25 @@ impl NetworkConnectionState {
     /// Returns true if the node is shutting down.
     pub(crate) const fn is_shutting_down(&self) -> bool {
         matches!(self, Self::ShuttingDown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attribution_addr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn attribution_addr_uses_advertised_listening_port() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)), 43_210);
+
+        assert_eq!(attribution_addr(remote, Some(30_303)), SocketAddr::new(remote.ip(), 30_303));
+    }
+
+    #[test]
+    fn attribution_addr_retains_ip_with_zero_unknown_port() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)), 43_210);
+
+        assert_eq!(attribution_addr(remote, None), SocketAddr::new(remote.ip(), 0));
     }
 }

@@ -72,6 +72,11 @@ pub struct SessionInfo {
     pub version: EthVersion,
     /// The kind of peer this session represents
     pub peer_kind: PeerKind,
+    /// Best-known peer address for attribution.
+    ///
+    /// A zero port means the peer did not advertise a redial port. Network-generated session
+    /// events retain the observed remote IP in that case instead of dropping the address.
+    pub listening_addr: Option<SocketAddr>,
 }
 
 /// (Non-exhaustive) List of the different events emitted by the network that are of interest for

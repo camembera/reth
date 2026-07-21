@@ -837,6 +837,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                 messages,
                 status,
                 direction,
+                listening_addr,
             } => {
                 let total_active = self.num_active_peers.fetch_add(1, Ordering::Relaxed) + 1;
                 self.metrics.connected_peers.set(total_active as f64);
@@ -879,6 +880,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                     status,
                     version,
                     peer_kind,
+                    listening_addr,
                 };
 
                 self.event_sender

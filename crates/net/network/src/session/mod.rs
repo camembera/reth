@@ -646,6 +646,7 @@ impl<N: NetworkPrimitives> SessionManager<N> {
                     timeout,
                     range_info: remote_range_info,
                     supports_snap,
+                    peer_listen_port,
                 })
             }
             PendingSessionEvent::Disconnected { remote_addr, session_id, direction, error } => {
@@ -783,6 +784,8 @@ pub enum SessionEvent<N: NetworkPrimitives> {
         range_info: Option<BlockRangeInfo>,
         /// Whether the connection negotiated `snap/2` and can serve [`PeerRequest::GetSnap`].
         supports_snap: bool,
+        /// TCP listening port announced by peer in devp2p `Hello`, if non-zero.
+        peer_listen_port: Option<u16>,
     },
     /// The peer was already connected with another session.
     AlreadyConnected {

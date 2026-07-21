@@ -76,6 +76,7 @@ use reth_transaction_pool::{
     PropagatedTransactions, TransactionPool, ValidPoolTransaction,
 };
 use std::{
+    net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -1247,7 +1248,7 @@ where
         info: SessionInfo,
         messages: PeerRequestSender<PeerRequest<N>>,
     ) {
-        let SessionInfo { peer_id, client_version, version, .. } = info;
+        let SessionInfo { peer_id, client_version, version, listening_addr, .. } = info;
 
         // Insert a new peer into the peerset.
         let peer = PeerMetadata::<N>::new(
@@ -1256,6 +1257,7 @@ where
             client_version,
             self.config.max_transactions_seen_by_peer_history,
             info.peer_kind,
+            listening_addr,
         );
         let peer = match self.peers.entry(peer_id) {
             Entry::Occupied(mut entry) => {
@@ -1413,6 +1415,7 @@ where
 
         let Some(peer) = self.peers.get_mut(&peer_id) else { return };
         let client_version = peer.client_version.clone();
+        let listening_addr = peer.listening_addr;
 
         let start = Instant::now();
 
@@ -1518,7 +1521,7 @@ where
                         .filter_map(|r| r.as_ref().ok().map(|outcome| outcome.hash))
                         .collect();
                     if !accepted.is_empty() {
-                        cb.record_accepted_from_peer(peer_id, &accepted);
+                        cb.record_accepted_from_peer(peer_id, listening_addr, &accepted);
                     }
                 }
 
@@ -2188,6 +2191,10 @@ pub struct PeerMetadata<N: NetworkPrimitives = EthNetworkPrimitives> {
     client_version: Arc<str>,
     /// The kind of peer.
     peer_kind: PeerKind,
+    /// Best-known attribution address forwarded to the provenance callback.
+    ///
+    /// Port zero means the peer did not advertise a redial port.
+    listening_addr: Option<SocketAddr>,
 }
 
 impl<N: NetworkPrimitives> PeerMetadata<N> {
@@ -2198,6 +2205,7 @@ impl<N: NetworkPrimitives> PeerMetadata<N> {
         client_version: Arc<str>,
         max_transactions_seen_by_peer: u32,
         peer_kind: PeerKind,
+        listening_addr: Option<SocketAddr>,
     ) -> Self {
         Self {
             seen_transactions: LruCache::with_hasher(
@@ -2208,7 +2216,13 @@ impl<N: NetworkPrimitives> PeerMetadata<N> {
             version,
             client_version,
             peer_kind,
+            listening_addr,
         }
+    }
+
+    /// Best-known attribution address. Port zero means no redial port was advertised.
+    pub const fn listening_addr(&self) -> Option<SocketAddr> {
+        self.listening_addr
     }
 
     /// Returns a reference to the peer's request sender channel.
@@ -2393,6 +2407,7 @@ mod tests {
         future::poll_fn,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         str::FromStr,
+        sync::Mutex,
         time::Instant,
     };
     use tracing::error;
@@ -2402,6 +2417,22 @@ mod tests {
         CoinbaseTipOrdering<EthPooledTransaction>,
         InMemoryBlobStore,
     >;
+
+    #[derive(Default)]
+    struct RecordingProvenanceSink {
+        calls: Mutex<Vec<(PeerId, Option<SocketAddr>, Vec<TxHash>)>>,
+    }
+
+    impl TransactionProvenanceSink for RecordingProvenanceSink {
+        fn record_accepted_from_peer(
+            &self,
+            peer_id: PeerId,
+            listening_addr: Option<SocketAddr>,
+            accepted_tx_hashes: &[TxHash],
+        ) {
+            self.calls.lock().unwrap().push((peer_id, listening_addr, accepted_tx_hashes.to_vec()));
+        }
+    }
 
     async fn new_eth_tx_manager() -> (
         TransactionsManager<EthTestPool, EthNetworkPrimitives>,
@@ -2458,6 +2489,96 @@ mod tests {
             tx_gen.transaction().nonce(nonce).into_eip1559().try_into_recovered().unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn peer_metadata_retains_port_zero_attribution_addr() {
+        let (mut tx_manager, _network) = new_eth_tx_manager().await;
+        let peer_id = PeerId::random();
+        let attribution_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 0);
+        let (tx, _rx) = mpsc::channel::<PeerRequest>(1);
+        let messages = PeerRequestSender::new(peer_id, tx);
+        let info = SessionInfo {
+            peer_id,
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51_234),
+            client_version: Arc::from(""),
+            capabilities: Arc::new(vec![].into()),
+            status: Arc::new(Default::default()),
+            version: EthVersion::Eth68,
+            peer_kind: PeerKind::Basic,
+            listening_addr: Some(attribution_addr),
+        };
+
+        tx_manager.on_network_event(NetworkEvent::ActivePeerSession { info, messages });
+
+        let stored = tx_manager.peers.get(&peer_id).expect("peer recorded");
+        assert_eq!(stored.listening_addr(), Some(attribution_addr));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provenance_callback_forwards_port_zero_attribution_addr() {
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let client = NoopProvider::default();
+        let pool = testing_pool();
+        let config = NetworkConfigBuilder::eth(secret_key, Runtime::test())
+            .disable_discovery()
+            .listener_port(0)
+            .build(client);
+        let transactions_manager_config = config.transactions_manager_config.clone();
+        let (_network_handle, _network, mut tx_manager, _) = NetworkManager::new(config)
+            .await
+            .unwrap()
+            .into_builder()
+            .transactions(pool, transactions_manager_config)
+            .split_with_handle();
+        let sink = Arc::new(RecordingProvenanceSink::default());
+        tx_manager = tx_manager.with_provenance_callback(sink.clone());
+
+        let peer_id = PeerId::random();
+        let attribution_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 0);
+        let (peer_tx, _peer_rx) = mpsc::channel::<PeerRequest>(1);
+        let messages = PeerRequestSender::new(peer_id, peer_tx);
+        let info = SessionInfo {
+            peer_id,
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51_234),
+            client_version: Arc::from(""),
+            capabilities: Arc::new(vec![].into()),
+            status: Arc::new(Default::default()),
+            version: EthVersion::Eth68,
+            peer_kind: PeerKind::Basic,
+            listening_addr: Some(attribution_addr),
+        };
+        tx_manager.on_network_event(NetworkEvent::ActivePeerSession { info, messages });
+
+        let input = hex!(
+            "02f871018302a90f808504890aef60826b6c94ddf4c5025d1a5742cf12f74eec246d4432c295e487e09c3bbcc12b2b80c080a0f21a4eacd0bf8fea9c5105c543be5a1d8c796516875710fafafdf16d16d8ee23a001280915021bb446d1973501a67f93d2b38894a514b976e7b46dc2fe54598d76"
+        );
+        let signed_tx = TransactionSigned::decode(&mut &input[..]).unwrap();
+        let expected_hash = *signed_tx.hash();
+        tx_manager.on_network_tx_event(NetworkTransactionEvent::IncomingTransactions {
+            peer_id,
+            msg: Transactions(vec![signed_tx]),
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            poll_fn(|cx| {
+                let _ = tx_manager.poll_unpin(cx);
+                Poll::Ready(())
+            })
+            .await;
+            if !sink.calls.lock().unwrap().is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected one provenance callback; got {calls:?}");
+        let (recorded_peer, recorded_addr, recorded_hashes) = &calls[0];
+        assert_eq!(*recorded_peer, peer_id);
+        assert_eq!(*recorded_addr, Some(attribution_addr));
+        assert_eq!(recorded_hashes.as_slice(), &[expected_hash]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3305,6 +3426,7 @@ mod tests {
             status: Arc::new(Default::default()),
             version: EthVersion::Eth68,
             peer_kind: PeerKind::Basic,
+            listening_addr: None,
         };
         let messages: PeerRequestSender<PeerRequest> = PeerRequestSender::new(peer_id, tx);
         tx_manager

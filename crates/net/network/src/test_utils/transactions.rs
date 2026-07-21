@@ -96,6 +96,7 @@ pub fn new_mock_session(
             Arc::from(""),
             DEFAULT_MAX_COUNT_TRANSACTIONS_SEEN_BY_PEER,
             PeerKind::Trusted,
+            None,
         ),
         to_mock_session_rx,
     )
