@@ -973,13 +973,13 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
     {
         let (handle, network, txpool, eth) = builder
             .transactions_with_policies(
-                pool,
+                pool.clone(),
                 self.config().network.transactions_manager_config(),
                 self.config().network.tx_propagation_policy,
                 StrictEthAnnouncementFilter::default(),
             )
             .with_tx_provenance_callback(cb)
-            .request_handler(self.provider().clone())
+            .request_handler_with_blob_store(self.provider().clone(), pool.blob_store())
             .split_with_handle();
 
         self.executor.spawn_critical_blocking_task("p2p txpool", Box::pin(txpool));
